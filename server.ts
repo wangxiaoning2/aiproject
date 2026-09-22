@@ -3,6 +3,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_INDEX_FILE, buildIndex } from "./rag/ingest.ts";
+import { queryEmbedderFor, type Embedder } from "./rag/embed.ts";
+import { indexStats, loadIndex, searchIndex } from "./rag/store.ts";
+import type { Hit, IndexFile } from "./rag/types.ts";
 
 /* ------------------------------------------------------------------ *
  * 配置：全部走环境变量，代码里不出现任何密钥
@@ -20,6 +24,10 @@ const PRICE_OUT = Number(process.env.PRICE_OUT || 8);  // 元 / 百万 token（�
 
 // 没有 API Key 就自动进 mock 模式 —— 保证你 clone 下来就能跑
 const MOCK = process.env.LLM_MOCK === "1" || !API_KEY;
+
+// 检索参数：召回几条。这个数字是 RAG 里最常被调的一个旋钮
+const RAG_TOP_K = Number(process.env.RAG_TOP_K || 4);
+const RAG_INDEX_FILE = process.env.RAG_INDEX || DEFAULT_INDEX_FILE;
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -97,6 +105,73 @@ function trimContext(messages: ChatMessage[], budget: number): { kept: ChatMessa
   }
 
   return { kept: [...system, ...kept], trimmed: rest.length - kept.length };
+}
+
+/* ------------------------------------------------------------------ *
+ * RAG：在线检索
+ *
+ * 离线部分（读文件 → 切块 → 算向量）在 rag/ingest.ts，只跑一次。
+ * 这里只负责提问时的那一半：算问题向量 → 取最像的几段 → 拼进提示词。
+ * ------------------------------------------------------------------ */
+let ragIndex: IndexFile | null = null;
+let ragEmbedder: Embedder | null = null;
+
+async function initRag(): Promise<void> {
+  let index = await loadIndex(RAG_INDEX_FILE);
+
+  // 没索引就顺手建一份。只在"本地 mock 嵌入"时自动做，
+  // 否则一启动就悄悄花掉你真实嵌入接口的钱。
+  if (!index && !process.env.EMBED_MODEL) {
+    console.log("[rag] 没找到索引，用本地伪嵌入自动构建一份…");
+    try {
+      await buildIndex({ quiet: true });
+      index = await loadIndex(RAG_INDEX_FILE);
+    } catch (err) {
+      console.warn(`[rag] 自动建索引失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (!index) {
+    console.log("[rag] 知识库未就绪。放几篇笔记进 data/，再跑 node rag/ingest.ts");
+    return;
+  }
+
+  ragIndex = index;
+  ragEmbedder = queryEmbedderFor(index);
+  console.log(
+    `[rag] 知识库就绪：${index.chunks.length} 个块 · ${index.provider} · ${index.model} · ${index.dim} 维`,
+  );
+}
+
+async function retrieve(query: string, topK: number): Promise<{ hits: Hit[]; tookMs: number }> {
+  if (!ragIndex || !ragEmbedder) throw new Error("知识库未就绪：先跑 node rag/ingest.ts");
+
+  const started = Date.now();
+  const [vector] = await ragEmbedder.embed([query]);
+  const hits = searchIndex(ragIndex, vector, topK);
+  return { hits, tookMs: Date.now() - started };
+}
+
+/**
+ * 把召回的几段拼成"小抄"，塞进 system prompt。
+ * 面试里这段的每一句都可以被追问：
+ *   为什么要写"资料里没有就说不知道"？→ 不加这句，模型一定会用自己脑子里的知识补
+ *   为什么要标来源？→ 让用户能自己核对，这是 RAG 相对纯聊天最大的产品价值
+ */
+function buildRagSystemPrompt(hits: Hit[]): string {
+  const blocks = hits
+    .map((h, i) => `【资料 ${i + 1}】来源：${h.chunk.source}（小节：${h.chunk.heading}）\n${h.chunk.text}`)
+    .join("\n\n");
+
+  return [
+    "下面是从我的知识库里检索到的资料，请只依据这些资料回答问题。",
+    "要求：",
+    "1. 只用资料里出现过的信息，不要用自己的知识补充；",
+    "2. 资料里没有的内容，直接说「笔记里没有相关记录」，不要猜；",
+    "3. 用【资料 N】标注依据，方便我核对。",
+    "",
+    blocks,
+  ].join("\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -225,27 +300,50 @@ const MOCK_REPLY = `现在是 mock 模式，你看到的是本地逐字"假装"�
 
 跑通这三步，你就不再会觉得大模型是个黑盒了——它只是一个慢一点、按流返回、可能中途挂掉的接口。`;
 
+/**
+ * mock 模式下"基于资料回答"长什么样。
+ * 注意：这几段话不是我编的，是刚刚真的从 data/ 里检索出来的原文——
+ * 模型在真实链路里干的事，就是把它改写成通顺的人话。
+ */
+function mockRagReply(hits: Hit[], question: string): string {
+  const used = hits.slice(0, Math.min(3, hits.length));
+  const lines = used.map((h) => {
+    const firstSentence = h.chunk.text.replace(/\n/g, " ").split(/(?<=[。！？])/)[0] || h.chunk.text;
+    return `依据【资料 ${h.rank}】（${h.chunk.source} · ${h.chunk.heading}）：${firstSentence}`;
+  });
+
+  return `（mock 模式，这段流是本地伪造的，没有花你一分钱）
+
+关于「${question}」，检索到了 ${hits.length} 段笔记，答案大致是这样：
+
+${lines.join("\n\n")}
+
+上面每一条都能追溯到原始笔记，这就是 RAG 相对"直接问模型"最大的差别：答案有出处，编造的空间被压掉了。`;
+}
+
 async function streamMock(
   res: ServerResponse,
   signal: AbortSignal,
   started: number,
   kept: ChatMessage[],
   trimmed: number,
+  ragHits: Hit[] | null = null,
 ): Promise<void> {
   const lastUser = [...kept].reverse().find((m) => m.role === "user")?.content ?? "";
   const shouldFail = lastUser.includes("测试报错");
+  const reply = ragHits && ragHits.length > 0 ? mockRagReply(ragHits, lastUser) : MOCK_REPLY;
 
   await sleep(260, signal); // 模拟首 token 之前的等待，让 TTFT 有意义
 
   let text = "";
   let firstTokenAt = 0;
 
-  for (let i = 0; i < MOCK_REPLY.length; i += 2) {
+  for (let i = 0; i < reply.length; i += 2) {
     if (signal.aborted) return; // 客户端断了就停，别做无用功
     if (shouldFail && i > 30) {
       throw new Error("模拟的上游故障：第 30 个字符之后连接被重置");
     }
-    const piece = MOCK_REPLY.slice(i, i + 2);
+    const piece = reply.slice(i, i + 2);
     if (!firstTokenAt) firstTokenAt = Date.now();
     text += piece;
     sse(res, "token", { t: piece });
@@ -296,12 +394,40 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
     ? Math.min(2, Math.max(0, Number(payload.temperature)))
     : 0.7;
 
+  // 知识库开关：关掉就是普通聊天，打开就是 RAG
+  const useRag = payload.useRag === true;
+  const topK = Number.isFinite(payload.topK)
+    ? Math.min(10, Math.max(1, Number(payload.topK)))
+    : RAG_TOP_K;
+
   const incoming: ChatMessage[] = (Array.isArray(payload.messages) ? payload.messages : [])
     .filter((m: any) => m && typeof m.content === "string" && ["user", "assistant", "system"].includes(m.role))
     .map((m: any) => ({ role: m.role, content: m.content }));
 
-  const withSystem: ChatMessage[] = systemPrompt
-    ? [{ role: "system", content: systemPrompt }, ...incoming]
+  // 检索必须在写响应头之前完成——查不到资料，就没法给出一个正常的流
+  let ragHits: Hit[] | null = null;
+  let ragTookMs = 0;
+
+  if (useRag) {
+    const question = [...incoming].reverse().find((m) => m.role === "user")?.content ?? "";
+    try {
+      const result = await retrieve(question, topK);
+      ragHits = result.hits;
+      ragTookMs = result.tookMs;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: message }));
+      return;
+    }
+  }
+
+  const systemParts = [systemPrompt];
+  if (ragHits && ragHits.length > 0) systemParts.push(buildRagSystemPrompt(ragHits));
+  const mergedSystem = systemParts.filter(Boolean).join("\n\n");
+
+  const withSystem: ChatMessage[] = mergedSystem
+    ? [{ role: "system", content: mergedSystem }, ...incoming]
     : incoming;
 
   const { kept, trimmed } = trimContext(withSystem, MAX_CONTEXT_TOKENS);
@@ -318,6 +444,18 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   const started = Date.now();
   const controller = new AbortController();
 
+  // 先把"这次检索到了什么"发给前端。
+  // 这一步是 RAG 调试的关键：回答不对时，九成问题在召回，不在这里。
+  if (useRag && ragHits) {
+    sse(res, "rag", {
+      topK,
+      tookMs: ragTookMs,
+      provider: ragIndex?.provider ?? "",
+      model: ragIndex?.model ?? "",
+      hits: publicHits(ragHits),
+    });
+  }
+
   // 用户点"停止"或关掉页面 → 立刻掐掉上游请求
   res.on("close", () => {
     if (!controller.signal.aborted) {
@@ -329,12 +467,13 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   console.log(
     `[chat] model=${MOCK ? "mock" : MODEL} temp=${temperature} ` +
     `messages=${kept.length}${trimmed ? ` (裁剪掉 ${trimmed} 条)` : ""} ` +
-    `≈${countTokens(kept)} tokens`,
+    `≈${countTokens(kept)} tokens` +
+    (useRag ? ` · RAG 召回 ${ragHits?.length ?? 0} 段 / ${ragTookMs}ms` : ""),
   );
 
   try {
     if (MOCK) {
-      await streamMock(res, controller.signal, started, kept, trimmed);
+      await streamMock(res, controller.signal, started, kept, trimmed, ragHits);
     } else {
       await streamUpstream(res, controller.signal, kept, temperature, started, trimmed);
     }
@@ -349,14 +488,105 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   }
 }
 
+/** 给前端的检索结果：只保留需要展示的字段，别把向量也发过去 */
+function publicHits(hits: Hit[]) {
+  return hits.map((h) => ({
+    rank: h.rank,
+    score: Number(h.score.toFixed(4)),
+    source: h.chunk.source,
+    heading: h.chunk.heading,
+    chars: h.chunk.text.length,
+    text: h.chunk.text,
+  }));
+}
+
+/* ------------------------------------------------------------------ *
+ * POST /api/rag/search —— 只检索、不调模型
+ * 调 RAG 时用得最多的一个接口：答案不对，先看这里召回了什么
+ * ------------------------------------------------------------------ */
+async function handleRagSearch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let payload: any;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: "请求体不是合法 JSON" }));
+    return;
+  }
+
+  const query = String(payload.query ?? "").trim();
+  if (!query) {
+    res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: "query 不能为空" }));
+    return;
+  }
+
+  const topK = Number.isFinite(payload.topK)
+    ? Math.min(10, Math.max(1, Number(payload.topK)))
+    : RAG_TOP_K;
+
+  try {
+    const { hits, tookMs } = await retrieve(query, topK);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({
+      query,
+      topK,
+      tookMs,
+      provider: ragIndex?.provider ?? "",
+      model: ragIndex?.model ?? "",
+      dim: ragIndex?.dim ?? 0,
+      hits: publicHits(hits),
+    }));
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+  }
+}
+
+/** POST /api/rag/rebuild —— 改了 data/ 或切块参数之后重建索引 */
+async function handleRagRebuild(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const { index, files } = await buildIndex({ quiet: true });
+    ragIndex = index;
+    ragEmbedder = queryEmbedderFor(index);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ ok: true, files, ...indexStats(index) }));
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * 启动
  * ------------------------------------------------------------------ */
+await initRag();
+
 const server = createServer((req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
   if (url.pathname === "/api/chat" && req.method === "POST") {
     void handleChat(req, res);
+    return;
+  }
+
+  if (url.pathname === "/api/rag/search" && req.method === "POST") {
+    void handleRagSearch(req, res);
+    return;
+  }
+
+  if (url.pathname === "/api/rag/rebuild" && req.method === "POST") {
+    void handleRagRebuild(req, res);
+    return;
+  }
+
+  if (url.pathname === "/api/rag/stats" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(
+      ragIndex
+        ? indexStats(ragIndex)
+        : { ready: false, hint: "没有索引。放几篇笔记到 data/，然后跑 node rag/ingest.ts" },
+    ));
     return;
   }
 
@@ -369,6 +599,8 @@ const server = createServer((req, res) => {
       maxContextTokens: MAX_CONTEXT_TOKENS,
       priceIn: PRICE_IN,
       priceOut: PRICE_OUT,
+      rag: ragIndex ? indexStats(ragIndex) : { ready: false },
+      ragTopK: RAG_TOP_K,
     }));
     return;
   }
@@ -381,7 +613,13 @@ server.listen(PORT, () => {
   console.log(`  流式对话 demo 已启动 →  http://localhost:${PORT}`);
   console.log(`  模式：${MOCK ? "mock（未检测到 LLM_API_KEY，本地假装流式）" : `${MODEL} @ ${BASE_URL}`}`);
   console.log(`  上下文预算：${MAX_CONTEXT_TOKENS} tokens`);
+  console.log(
+    `  知识库：${ragIndex
+      ? `${ragIndex.chunks.length} 个块 · ${ragIndex.provider} · 召回 ${RAG_TOP_K} 条`
+      : "未就绪（放几篇笔记到 data/，跑 node rag/ingest.ts）"}`,
+  );
   console.log("");
   console.log("  试试：在输入框里发「测试报错」，看中途失败长什么样。");
+  console.log("  打开右侧「知识库」开关，同一个问题会变成「基于你的笔记」回答。");
   console.log("");
 });

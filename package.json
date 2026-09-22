@@ -6,6 +6,8 @@
   "description": "手写 SSE 的流式对话 demo：不用任何框架，看清大模型流式输出的每一步",
   "scripts": {
     "start": "node server.ts",
+    "ingest": "node rag/ingest.ts",
+    "query": "node rag/query.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

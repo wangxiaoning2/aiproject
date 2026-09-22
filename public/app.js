@@ -21,6 +21,16 @@ const els = {
   cost: document.getElementById('mCost'),
   ctx: document.getElementById('mCtx'),
   usageHint: document.getElementById('usageHint'),
+  // —— 知识库（RAG）相关 ——
+  useRag: document.getElementById('useRag'),
+  topK: document.getElementById('topK'),
+  topKVal: document.getElementById('topKVal'),
+  ragStats: document.getElementById('ragStats'),
+  ragSources: document.getElementById('ragSources'),
+  ragMeta: document.getElementById('ragMeta'),
+  ragHits: document.getElementById('ragHits'),
+  searchOnly: document.getElementById('searchOnlyBtn'),
+  rebuild: document.getElementById('rebuildBtn'),
 };
 
 /* 对话历史存在内存里，每次请求整包发过去 —— 模型本身没有记忆 */
@@ -139,6 +149,9 @@ async function runStream(attempt) {
         messages: state.messages,
         systemPrompt: els.systemPrompt.value,
         temperature: Number(els.temperature.value),
+        // 打开开关就走 RAG：服务端会先检索，再把资料拼进 system prompt
+        useRag: els.useRag.checked,
+        topK: Number(els.topK.value),
       }),
       signal: state.controller.signal,
     });
@@ -181,6 +194,9 @@ async function runStream(attempt) {
         }
         received += payload.t;
         pushToken(wrap, payload.t);
+      } else if (event === 'rag') {
+        // 服务端在生成之前先把"这次检索到了什么"推过来
+        renderRagHits(payload);
       } else if (event === 'done') {
         applyDone(payload);
       } else if (event === 'error') {
@@ -252,7 +268,87 @@ async function runStream(attempt) {
 }
 
 /* ------------------------------------------------------------------
- * 3. 把服务端给的真实数据摊到面板上
+ * 3. 召回面板：把"为什么是这几段"摊开给你看
+ *    RAG 调不好的时候，九成问题在这里，不在模型那里。
+ * ------------------------------------------------------------------ */
+function renderRagHits(payload) {
+  const hits = payload.hits || [];
+  els.ragHits.innerHTML = '';
+
+  if (!hits.length) {
+    els.ragMeta.textContent = '这一轮没有任何召回结果——知识库可能是空的，或者索引还没建。';
+    return;
+  }
+
+  const max = Math.max(...hits.map((h) => h.score), 0.0001);
+  const chars = hits.reduce((s, h) => s + (h.chars || 0), 0);
+  els.ragMeta.textContent =
+    `检索 ${payload.tookMs}ms · 最高相似度 ${hits[0].score.toFixed(4)} · ` +
+    `注入提示词 ${hits.length} 段共 ${chars} 字（≈${chars} token，都是要付费的输入）`;
+
+  for (const h of hits) {
+    const box = document.createElement('div');
+    box.className = 'hit';
+
+    const top = document.createElement('div');
+    top.className = 'top';
+    const rank = document.createElement('span');
+    rank.className = 'rank';
+    rank.textContent = '#' + h.rank;
+    const score = document.createElement('span');
+    score.className = 'score';
+    score.textContent = '相似度 ' + h.score.toFixed(4);
+    top.append(rank, score);
+
+    // 条形长度按本次最高分归一化：绝对值很难有直觉，相对高低一眼就懂
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    bar.style.width = Math.max(3, Math.round((h.score / max) * 100)) + '%';
+
+    const src = document.createElement('p');
+    src.className = 'src';
+    src.textContent = `${h.source} · ${h.heading}`;
+
+    const txt = document.createElement('div');
+    txt.className = 'txt';
+    txt.textContent = h.text;
+
+    const more = document.createElement('button');
+    more.className = 'more';
+    more.textContent = '展开全文';
+    more.addEventListener('click', () => {
+      box.classList.toggle('open');
+      more.textContent = box.classList.contains('open') ? '收起' : '展开全文';
+    });
+
+    box.append(top, bar, src, txt, more);
+    els.ragHits.append(box);
+  }
+}
+
+function applyRagStats(stats) {
+  if (!stats || !stats.ready) {
+    els.ragStats.textContent =
+      (stats && stats.hint) ||
+      '知识库未就绪：放几篇 .md 笔记到 data/ 文件夹，再点下面的重建按钮。';
+    els.useRag.checked = false;
+    return;
+  }
+
+  els.ragStats.textContent =
+    `${stats.totalChunks} 个块 · ${stats.sources.length} 篇笔记 · ${stats.model} · ${stats.dim} 维`;
+
+  els.ragSources.innerHTML = '';
+  for (const s of stats.sources) {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.textContent = `${s.source} (${s.chunks})`;
+    els.ragSources.append(chip);
+  }
+}
+
+/* ------------------------------------------------------------------
+ * 4. 把服务端给的真实数据摊到面板上
  * ------------------------------------------------------------------ */
 function applyDone(payload) {
   const u = payload.usage || {};
@@ -281,7 +377,7 @@ function logRaw(text) {
 }
 
 /* ------------------------------------------------------------------
- * 4. 交互细节
+ * 5. 交互细节
  * ------------------------------------------------------------------ */
 function autoGrow() {
   els.input.style.height = 'auto';
@@ -312,6 +408,8 @@ els.clear.addEventListener('click', () => {
   state.messages = [];
   els.stream.innerHTML = '';
   els.raw.textContent = '等待请求…';
+  els.ragHits.innerHTML = '';
+  els.ragMeta.textContent = '还没有检索记录。问一句，或者点「只检索」。';
   ['ttft', 'total', 'tokIn', 'tokOut', 'cost', 'ctx'].forEach((k) => {
     els[k].textContent = '—';
   });
@@ -321,8 +419,60 @@ els.temperature.addEventListener('input', () => {
   els.tempVal.textContent = Number(els.temperature.value).toFixed(1);
 });
 
+els.topK.addEventListener('input', () => {
+  els.topKVal.textContent = els.topK.value;
+});
+
+/* 「只检索」：不调模型，所以一分钱不花。
+   调 RAG 时最常用的一步——先确认召回对不对，再去看回答。 */
+els.searchOnly.addEventListener('click', async () => {
+  const query = els.input.value.trim();
+  if (!query) {
+    els.ragMeta.textContent = '先在下面的输入框里写一句问题，再点「只检索」。';
+    els.input.focus();
+    return;
+  }
+
+  els.searchOnly.disabled = true;
+  els.ragMeta.textContent = '正在检索…';
+
+  try {
+    const res = await fetch('/api/rag/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, topK: Number(els.topK.value) }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `服务端返回 ${res.status}`);
+    renderRagHits(data);
+  } catch (err) {
+    els.ragMeta.textContent = `检索失败：${err.message || err}`;
+    els.ragHits.innerHTML = '';
+  } finally {
+    els.searchOnly.disabled = false;
+  }
+});
+
+els.rebuild.addEventListener('click', async () => {
+  els.rebuild.disabled = true;
+  els.ragStats.textContent = '正在重建索引…';
+
+  try {
+    const res = await fetch('/api/rag/rebuild', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `服务端返回 ${res.status}`);
+    applyRagStats(data);
+    els.ragHits.innerHTML = '';
+    els.ragMeta.textContent = `索引已重建：${data.files} 篇笔记 → ${data.totalChunks} 个块。现在可以重新检索了。`;
+  } catch (err) {
+    els.ragStats.textContent = `重建失败：${err.message || err}`;
+  } finally {
+    els.rebuild.disabled = false;
+  }
+});
+
 /* ------------------------------------------------------------------
- * 5. 启动时问一下服务端当前是什么模式
+ * 6. 启动时问一下服务端当前是什么模式
  * ------------------------------------------------------------------ */
 (async function boot() {
   try {
@@ -332,6 +482,12 @@ els.temperature.addEventListener('input', () => {
     els.usageHint.textContent = cfg.mock
       ? '当前是 mock 模式：流量是本地伪造的，不花钱。配好 LLM_API_KEY 重启就能切到真实模型。'
       : `成本按 ¥${cfg.priceIn}/百万(输入)、¥${cfg.priceOut}/百万(输出) 估算。上下文预算 ${cfg.maxContextTokens} tokens。`;
+
+    if (cfg.ragTopK) {
+      els.topK.value = String(cfg.ragTopK);
+      els.topKVal.textContent = String(cfg.ragTopK);
+    }
+    applyRagStats(cfg.rag);
   } catch {
     els.modeBadge.textContent = '服务端未响应';
     els.modeBadge.className = 'badge';
