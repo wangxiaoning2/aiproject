@@ -1,0 +1,17 @@
+{
+  "name": "ai-week1-streaming",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "手写 SSE 的流式对话 demo：不用任何框架，看清大模型流式输出的每一步",
+  "scripts": {
+    "start": "node server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

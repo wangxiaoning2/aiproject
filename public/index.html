@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>流式对话 demo · 手写 SSE，不用框架</title>
+<style>
+  :root{
+    --bg:#F7F7F5;
+    --surface:#FFFFFF;
+    --ink:#1D1D1B;
+    --ink-2:#55554F;
+    --ink-3:#8A8A82;
+    --line:#E5E4DF;
+    --blue:#185FA5;
+    --blue-bg:#E6F1FB;
+    --blue-bg2:#F3F8FD;
+    --amber:#854F0B;
+    --amber-bg:#FAEEDA;
+    --red:#A32D2D;
+    --red-bg:#FCEBEB;
+    --teal:#0F6E56;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:15px;line-height:1.7;-webkit-font-smoothing:antialiased;
+  }
+  .app{display:grid;grid-template-columns:minmax(0,1fr) 340px;height:100vh;gap:20px;padding:20px;max-width:1400px;margin:0 auto}
+  .col{min-height:0;display:flex;flex-direction:column;gap:14px}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)}
+  .head{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  h1{font-size:17px;font-weight:600;margin:0;letter-spacing:-.01em}
+  .badge{font-size:12px;border-radius:999px;padding:3px 10px;background:var(--amber-bg);color:var(--amber);white-space:nowrap}
+  .badge.live{background:var(--blue-bg);color:var(--blue)}
+  .head .sp{margin-left:auto}
+
+  .stream{flex:1;overflow-y:auto;padding:22px;display:flex;flex-direction:column;gap:16px}
+  .msg{max-width:78%}
+  .msg.user{align-self:flex-end}
+  .who{font-size:12px;color:var(--ink-3);margin:0 0 5px}
+  .msg.user .who{text-align:right}
+  .bubble{
+    border-radius:var(--radius);padding:12px 16px;white-space:pre-wrap;word-break:break-word;
+    background:var(--blue-bg2);border:1px solid #DCE8F6;
+  }
+  .msg.user .bubble{background:var(--blue);border-color:var(--blue);color:#fff}
+  .bubble.err{background:var(--red-bg);border-color:#F1D5D5;color:var(--red)}
+  .bubble .cursor{display:inline-block;width:2px;height:15px;background:var(--blue);vertical-align:-2px;animation:blink 1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .meta{font-size:12px;color:var(--ink-3);margin:6px 0 0}
+
+  .composer{border-top:1px solid var(--line);padding:14px 18px;display:flex;gap:10px;align-items:flex-end}
+  textarea{
+    flex:1;resize:none;border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+    font:inherit;font-size:14px;line-height:1.6;background:var(--surface);color:var(--ink);max-height:140px;outline:none;
+  }
+  textarea:focus{border-color:#B5D4F4}
+  button{
+    font:inherit;font-size:14px;border:1px solid var(--line);background:var(--surface);color:var(--ink);
+    border-radius:10px;padding:9px 16px;cursor:pointer;white-space:nowrap;transition:.15s;
+  }
+  button:hover{border-color:#C9C8C2}
+  button.primary{background:var(--blue);border-color:var(--blue);color:#fff}
+  button.primary:hover{background:#14507F}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .linkbtn{background:none;border:none;color:var(--blue);font-size:12px;padding:4px 6px;cursor:pointer}
+
+  .side{overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px}
+  .panel h2{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--ink-2);letter-spacing:.02em}
+  .field{margin-bottom:14px}
+  .field:last-child{margin-bottom:0}
+  .field label{display:block;font-size:12px;color:var(--ink-3);margin-bottom:6px}
+  .field textarea{width:100%;min-height:74px;font-size:13px}
+  .row{display:flex;align-items:center;gap:10px}
+  input[type=range]{flex:1;accent-color:var(--blue)}
+  .val{font-size:13px;font-variant-numeric:tabular-nums;color:var(--ink-2);width:28px;text-align:right}
+
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .metric{background:#FAFAF8;border-radius:10px;padding:10px 12px}
+  .metric .k{font-size:11px;color:var(--ink-3);margin:0 0 2px}
+  .metric .v{font-size:16px;font-weight:600;margin:0;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .metric .v small{font-size:11px;font-weight:400;color:var(--ink-3);margin-left:2px}
+
+  .raw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.6;
+       background:#FBFBF9;border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+       height:230px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;color:var(--ink-2)}
+  .raw .ev{color:var(--blue);font-weight:500}
+  .raw .dm{color:var(--ink-3)}
+
+  .hint{font-size:12px;color:var(--ink-3);margin:10px 0 0;line-height:1.6}
+  kbd{font-family:inherit;font-size:11px;border:1px solid var(--line);border-radius:5px;padding:1px 5px;background:#FAFAF8;color:var(--ink-2)}
+
+  @media (max-width:900px){
+    .app{grid-template-columns:1fr;height:auto}
+    .col:first-child{height:78vh}
+    .side{overflow:visible}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="col">
+    <div class="card" style="display:flex;flex-direction:column;flex:1;min-height:0">
+      <div class="head">
+        <h1>流式对话 demo</h1>
+        <span class="badge" id="modeBadge">连接中…</span>
+        <span class="sp"></span>
+        <button class="linkbtn" id="clearBtn">清空对话</button>
+      </div>
+
+      <div class="stream" id="stream">
+        <div class="msg">
+          <p class="who">小提示</p>
+          <div class="bubble">随便发一句话试试。重点不是回答内容，而是右边的四个数字：首 token 延迟、总耗时、token 数、估算成本。
+
+想看错误处理，就发「测试报错」。想看中断，回答到一半点「停止生成」。</div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button class="primary" id="sendBtn">发送</button>
+        <button id="stopBtn" disabled>停止生成</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="col side">
+
+    <div class="panel">
+      <h2>请求参数</h2>
+      <div class="field">
+        <label>System prompt（模型的"人设"，每次请求都会带上）</label>
+        <textarea id="systemPrompt">你是一个说话简洁的技术助手，回答控制在三句话内。</textarea>
+      </div>
+      <div class="field">
+        <label>Temperature（越高越发散，0 最确定）</label>
+        <div class="row">
+          <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7">
+          <span class="val" id="tempVal">0.7</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>本次请求的实测数据</h2>
+      <div class="metrics">
+        <div class="metric"><p class="k">首 token 延迟</p><p class="v" id="mTtft">—</p></div>
+        <div class="metric"><p class="k">总耗时</p><p class="v" id="mTotal">—</p></div>
+        <div class="metric"><p class="k">输入 tokens</p><p class="v" id="mIn">—</p></div>
+        <div class="metric"><p class="k">输出 tokens</p><p class="v" id="mOut">—</p></div>
+        <div class="metric"><p class="k">估算成本</p><p class="v" id="mCost">—</p></div>
+        <div class="metric"><p class="k">上下文条数</p><p class="v" id="mCtx">—</p></div>
+      </div>
+      <p class="hint" id="usageHint">成本按价格表估算，未启用真实 usage 时会用字数估算 token。</p>
+    </div>
+
+    <div class="panel">
+      <h2>原始 SSE 报文（这就是"打字机"的真相）</h2>
+      <div class="raw" id="raw">等待请求…</div>
+      <p class="hint">每帧格式：<br><span style="color:var(--blue)">event:</span> 事件名<br><span style="color:var(--blue)">data:</span> 一段 JSON<br>然后一个空行。就这么简单。</p>
+    </div>
+
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
